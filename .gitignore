@@ -1,0 +1,12 @@
+.DS_Store
+._*
+.build/
+dist/
+*.app/
+*.zip
+*.log
+*.mp4
+*.mov
+*.m4v
+*.xcuserstate
+xcuserdata/
