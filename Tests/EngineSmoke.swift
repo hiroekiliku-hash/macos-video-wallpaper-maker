@@ -19,10 +19,10 @@ func createSnapshotXPC(surface: IOSurface) -> AnyObject? { nil }
         assert(portrait, "Phone rotation did not reach the output buffer")
         renderer.setPlaying(false)
         RunLoop.main.run(until: Date().addingTimeInterval(1.4))
-        let frozen = renderer.player.currentTime().seconds
+        let frozen = renderer.playbackTime.seconds
         assert(renderer.player.rate == 0 && renderer.desktopLookAmount > 0.999)
         RunLoop.main.run(until: Date().addingTimeInterval(0.2))
-        assert(abs(renderer.player.currentTime().seconds - frozen) < 0.002)
+        assert(abs(renderer.playbackTime.seconds - frozen) < 0.002)
         renderer.setPlaying(true)
         RunLoop.main.run(until: Date().addingTimeInterval(0.5))
         assert(renderer.desktopLookAmount < 0.001)

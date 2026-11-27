@@ -4,7 +4,9 @@
 
 ## 下载
 
-从 [GitHub Releases](https://github.com/hiroekiliku-hash/macos-video-wallpaper-maker/releases) 下载 `WallpaperMaker-macOS-arm64-v1.0.0.zip`，解压后运行「安装制作器.command」。应用为本地签名，未经 Apple 公证；安装脚本校验应用签名后复制到当前用户目录。
+从 [GitHub Releases](https://github.com/hiroekiliku-hash/macos-video-wallpaper-maker/releases/latest) 下载 `WallpaperMaker-macOS-arm64-v1.0.1.zip`，解压后运行「安装制作器.command」。应用为本地签名，未经 Apple 公证；安装脚本校验应用签名后复制到当前用户目录。
+
+**1.0.1 修复内存累积风险**：限制输出帧队列与调色缓冲，定格后卸载解码器，失效实例及时回收。旧作品需打开 `作品.json`，重新生成、安装才能更新其引擎。详见 [更新记录](CHANGELOG.md)。
 
 系统若拦截脚本：终端输入 `/bin/zsh `（含空格），把该脚本拖进去回车。不要全局关闭 Gatekeeper、SIP 或锁屏保护。
 

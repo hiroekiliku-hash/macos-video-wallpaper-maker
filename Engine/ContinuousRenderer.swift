@@ -28,6 +28,11 @@ final class ContinuousRenderer {
     private var movie: Movie?
     private var timer: Timer?
     private var endObserver: NSObjectProtocol?
+    private var rampTimer: Timer?
+    private var stopped = false
+    private(set) var droppedFrames = 0
+    private var parkedTime: CMTime?
+    var playbackTime: CMTime { parkedTime ?? player.currentTime() }
     private var rampGeneration = 0
     private var firstFrame = false
     private var wantsPlayback = false
@@ -70,6 +75,7 @@ final class ContinuousRenderer {
     }
 
     private func chooseNextMovie() {
+        guard !stopped else { return }
         let previous = movie?.id
         if configuration.shuffle {
             movie = movies.filter { $0.id != previous }.randomElement() ?? movies.first
@@ -78,16 +84,25 @@ final class ContinuousRenderer {
             movie = movies[movieIndex]
         }
         guard let movie else { return }
+        loadMovie(movie)
+    }
+
+    private func loadMovie(_ movie: Movie, resumeAt: CMTime? = nil) {
         movieGeneration += 1
         let generation = movieGeneration
         isLoadingMovie = true
         firstFrame = false
         player.pause()
+        if let output, let oldItem = player.currentItem { oldItem.remove(output) }
+        output = nil
+        player.replaceCurrentItem(with: nil)
+        colorContext.clearCaches()
         if let endObserver { NotificationCenter.default.removeObserver(endObserver); self.endObserver = nil }
         let url = resources.appendingPathComponent("Movies/" + movie.file)
         let item = AVPlayerItem(url: url)
+        item.preferredForwardBufferDuration = 2
         let install: () -> Void = { [weak self] in
-            guard let self, self.movieGeneration == generation else { return }
+            guard let self, !self.stopped, self.movieGeneration == generation else { return }
             let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
                 kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
                 kCVPixelBufferIOSurfacePropertiesKey as String: [:],
@@ -101,14 +116,25 @@ final class ContinuousRenderer {
                 }
             self.player.replaceCurrentItem(with: item)
             self.isLoadingMovie = false
-            self.player.play()
-            self.startPump()
+            if let resumeAt {
+                self.player.seek(to: resumeAt, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+                    DispatchQueue.main.async {
+                        guard let self, !self.stopped, self.movieGeneration == generation else { return }
+                        self.startPump()
+                        self.player.play()
+                    }
+                }
+            } else {
+                self.player.play()
+                self.startPump()
+            }
             extensionLog("movie=\(movie.id)")
         }
         if movie.needsComposition == true {
             // Let AVFoundation apply the phone video's rotation/mirroring before decoding output.
-            AVVideoComposition.videoComposition(withPropertiesOf: item.asset) { composition, error in
+            AVVideoComposition.videoComposition(withPropertiesOf: item.asset) { [weak self] composition, error in
                 DispatchQueue.main.async {
+                    guard let self, !self.stopped, self.movieGeneration == generation else { return }
                     guard composition != nil else {
                         extensionLog("orientation composition failed: \(String(describing: error))")
                         return
@@ -121,21 +147,26 @@ final class ContinuousRenderer {
     }
 
     private func startPump() {
-        guard timer == nil else { return }
+        guard !stopped, timer == nil else { return }
         let timer = Timer(timeInterval: 1.0 / 30, repeats: true) { [weak self] _ in self?.pump() }
         self.timer = timer
         RunLoop.main.add(timer, forMode: .common)
     }
 
     private func pump() {
-        guard let output else { return }
+        autoreleasepool { pumpFrame() }
+    }
+
+    private func pumpFrame() {
+        guard !stopped, let output else { return }
         let appearanceChanged = advanceAppearance()
         if isLoadingMovie {
             if appearanceChanged, let sourceBuffer { present(sourceBuffer) }
             return
         }
         let time = output.itemTime(forHostTime: CACurrentMediaTime())
-        if output.hasNewPixelBuffer(forItemTime: time),
+        if display.sampleBufferRenderer.isReadyForMoreMediaData,
+           output.hasNewPixelBuffer(forItemTime: time),
            let buffer = output.copyPixelBuffer(forItemTime: time, itemTimeForDisplay: nil) {
             present(buffer)
             firstFrame = true
@@ -144,17 +175,21 @@ final class ContinuousRenderer {
             // Recolor the held frame too, including the last slow frames and snapshots.
             if appearanceChanged, let sourceBuffer { present(sourceBuffer) }
         }
-        if !wantsPlayback && !isRamping && firstFrame {
+        if !wantsPlayback && !isRamping && (firstFrame || latestBuffer != nil) {
             player.pause()
-            if appearanceTransition == nil { timer?.invalidate(); timer = nil }
+            if appearanceTransition == nil { parkDecoder() }
         }
         if wantsPlayback, firstFrame, player.currentItem?.status == .readyToPlay, let movie, movie.duration > 0,
            player.currentTime().seconds >= movie.duration - 0.04 { chooseNextMovie() }
     }
 
     private func present(_ buffer: CVPixelBuffer) {
+        guard !stopped else { return }
+        let renderer = display.sampleBufferRenderer
+        if renderer.status == .failed { renderer.flush() }
+        guard renderer.isReadyForMoreMediaData else { droppedFrames += 1; return }
         sourceBuffer = buffer
-        let buffer = colorAdjusted(buffer)
+        guard let buffer = colorAdjusted(buffer) else { droppedFrames += 1; return }
         var description: CMVideoFormatDescription?
         guard CMVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault,
             imageBuffer: buffer, formatDescriptionOut: &description) == noErr, let description else { return }
@@ -168,16 +203,12 @@ final class ContinuousRenderer {
             CFDictionarySetValue(dictionary, Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
                                  Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
         }
-        if display.status == .failed {
-            // Keep the still visible until there is a replacement sample to enqueue.
-            display.flush()
-        }
-        display.enqueue(sample)
+        renderer.enqueue(sample)
         latestBuffer = buffer
         presentedFrames += 1
     }
 
-    private func colorAdjusted(_ source: CVPixelBuffer) -> CVPixelBuffer {
+    private func colorAdjusted(_ source: CVPixelBuffer) -> CVPixelBuffer? {
         // Original decoded pixels are retained, so restoring full color never compounds a filter.
         guard desktopLookAmount > 0.00001 && !configuration.neutral else { return source }
         let size = CGSize(width: CVPixelBufferGetWidth(source), height: CVPixelBufferGetHeight(source))
@@ -190,13 +221,15 @@ final class ContinuousRenderer {
                 kCVPixelBufferMetalCompatibilityKey as String: true,
             ]
             colorPool = nil
-            CVPixelBufferPoolCreate(kCFAllocatorDefault, nil, attributes as CFDictionary, &colorPool)
+            CVPixelBufferPoolCreate(kCFAllocatorDefault,
+                [kCVPixelBufferPoolMinimumBufferCountKey: 2] as CFDictionary, attributes as CFDictionary, &colorPool)
             colorPoolSize = size
         }
         var destination: CVPixelBuffer?
         guard let colorPool,
-              CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, colorPool, &destination) == kCVReturnSuccess,
-              let destination else { return source }
+              CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(kCFAllocatorDefault, colorPool,
+                [kCVPixelBufferPoolAllocationThresholdKey: 3] as CFDictionary, &destination) == kCVReturnSuccess,
+              let destination else { return nil }
         CVBufferPropagateAttachments(source, destination)
         let input = CIImage(cvPixelBuffer: source)
         let image = configuration.image(input, amount: desktopLookAmount)
@@ -227,21 +260,26 @@ final class ContinuousRenderer {
     }
 
     func setPlaying(_ playing: Bool, smoothly: Bool = true) {
-        guard wantsPlayback != playing || !firstFrame else { return }
+        guard !stopped, wantsPlayback != playing || !firstFrame else { return }
+        rampTimer?.invalidate(); rampTimer = nil
         wantsPlayback = playing
         transitionAppearance(to: playing ? 0 : 1, duration: smoothly ? (playing ? configuration.resumeDuration : configuration.stopDuration) : 0)
         rampGeneration += 1
         let generation = rampGeneration
         if playing {
             isRamping = false
-            startPump()
-            if !isLoadingMovie { player.play() }
-            extensionLog("resume time=\(player.currentTime().seconds)")
+            if let time = parkedTime, let movie {
+                parkedTime = nil
+                loadMovie(movie, resumeAt: time)
+            } else {
+                startPump()
+                if !isLoadingMovie { player.play() }
+            }
+            extensionLog("resume time=\(playbackTime.seconds)")
         } else if firstFrame && smoothly && player.rate > 0 {
             isRamping = true
             let initialRate = player.rate
             let startedAt = CACurrentMediaTime()
-            var rampTimer: Timer?
             rampTimer = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] timer in
                 guard let self, self.rampGeneration == generation, !self.wantsPlayback else {
                     timer.invalidate(); return
@@ -252,16 +290,33 @@ final class ContinuousRenderer {
                     self.player.pause()
                     self.pump()
                     self.isRamping = false
-                    if self.appearanceTransition == nil { self.timer?.invalidate(); self.timer = nil }
+                    if self.appearanceTransition == nil { self.parkDecoder() }
                     timer.invalidate()
-                    extensionLog("frozen time=\(self.player.currentTime().seconds) frames=\(self.presentedFrames)")
+                    extensionLog("frozen time=\(self.playbackTime.seconds) frames=\(self.presentedFrames)")
                 }
             }
             RunLoop.main.add(rampTimer!, forMode: .common)
         } else if firstFrame {
             player.pause()
-            if appearanceTransition == nil { timer?.invalidate(); timer = nil }
+            if appearanceTransition == nil { parkDecoder() }
         }
+    }
+
+    // A desktop still needs two pixels surfaces, not a live decoder, asset and
+    // read-ahead cache. Recreate only this clip and seek to the retained time on resume.
+    private func parkDecoder() {
+        guard !wantsPlayback, !isLoadingMovie, parkedTime == nil, player.currentItem != nil else { return }
+        let time = player.currentTime()
+        guard time.isValid, time.seconds.isFinite else { return }
+        parkedTime = time
+        timer?.invalidate(); timer = nil
+        player.pause()
+        if let endObserver { NotificationCenter.default.removeObserver(endObserver); self.endObserver = nil }
+        if let output, let item = player.currentItem { item.remove(output) }
+        output = nil; player.replaceCurrentItem(with: nil)
+        if let colorPool { CVPixelBufferPoolFlush(colorPool, .excessBuffers) }
+        colorPool = nil; colorPoolSize = .zero
+        colorContext.clearCaches()
     }
 
     func snapshot() -> AnyObject? {
@@ -284,9 +339,27 @@ final class ContinuousRenderer {
         return buffer
     }
 
-    deinit {
-        timer?.invalidate()
-        if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
-        player.pause(); player.replaceCurrentItem(with: nil)
+    func shutdown() {
+        guard !stopped else { return }
+        stopped = true
+        movieGeneration += 1; rampGeneration += 1
+        timer?.invalidate(); timer = nil
+        rampTimer?.invalidate(); rampTimer = nil
+        if let endObserver { NotificationCenter.default.removeObserver(endObserver); self.endObserver = nil }
+        player.pause()
+        if let output, let item = player.currentItem { item.remove(output) }
+        output = nil
+        player.replaceCurrentItem(with: nil)
+        display.flushAndRemoveImage()
+        display.removeFromSuperlayer()
+        root.removeFromSuperlayer()
+        sourceBuffer = nil; latestBuffer = nil
+        if let colorPool { CVPixelBufferPoolFlush(colorPool, .excessBuffers) }
+        colorPool = nil; colorPoolSize = .zero
+        colorContext.clearCaches()
+        appearanceTransition = nil
+        parkedTime = nil
     }
+
+    deinit { shutdown() }
 }

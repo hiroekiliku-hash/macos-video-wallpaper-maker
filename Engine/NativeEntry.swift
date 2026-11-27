@@ -52,7 +52,9 @@ struct VideoWallpaperConfiguration: AppExtensionConfiguration {
         }
         connection.exportedInterface = interface
         connection.remoteObjectInterface = NSXPCInterface(with: WallpaperExtensionProxyXPCProtocol.self)
-        connection.exportedObject = Handler()
+        let handler = Handler()
+        connection.exportedObject = handler
+        connection.invalidationHandler = { [weak handler] in handler?.releaseConnection() }
         connection.resume()
         return true
     }
@@ -90,13 +92,27 @@ private final class Surface {
         renderer.setPlaying(preview)
         CATransaction.flush()
     }
+    func shutdown() {
+        renderer.shutdown()
+        context.layer = nil
+    }
 }
 
 final class Handler: NSObject, WallpaperExtensionXPCProtocol {
-    // Accessed only on the main queue, retained across XPC reconnections so that
-    // WallpaperAgent can keep the same context and exact frame through unlock.
-    private static var surfaces: [String: Surface] = [:]
-    private static var ids: [UUID: String] = [:]
+    private static let registry = SurfaceRegistry<Surface>(
+        pause: { $0.renderer.setPlaying(false, smoothly: false) },
+        dispose: { $0.shutdown() })
+    private var ownedIDs: [UUID: UUID] = [:]
+    deinit {
+        let leases = Array(ownedIDs.values)
+        DispatchQueue.main.async { for id in leases { Self.registry.release(id: id) } }
+    }
+    func releaseConnection() {
+        DispatchQueue.main.async { [self] in
+            for id in ownedIDs.values { Self.registry.release(id: id) }
+            ownedIDs.removeAll()
+        }
+    }
     func acquire(withId id: Any?, request: Any?, reply: @escaping (Any?, Error?) -> Void) {
         DispatchQueue.main.async {
             do {
@@ -105,10 +121,13 @@ final class Handler: NSObject, WallpaperExtensionXPCProtocol {
                 let display = request.flatMap { property("directDisplayID", in: $0) as? UInt32 } ?? 0
                 let preview = request.flatMap { property("isPreview", in: $0) as? Bool } ?? false
                 let key = "\(display)-\(preview ? "preview" : "live")"
-                let surface: Surface
-                if let previous = Self.surfaces[key] { surface = previous; surface.renderer.resize(size, scale: scale) }
-                else { surface = try Surface(size: size, scale: scale, preview: preview); Self.surfaces[key] = surface }
-                if let id = uuid(id) { Self.ids[id] = key }
+                guard let requestID = uuid(id) else { throw CocoaError(.featureUnsupported) }
+                let leaseID = self.ownedIDs[requestID] ?? UUID()
+                let surface = try Self.registry.acquire(id: leaseID, key: key) {
+                    try Surface(size: size, scale: scale, preview: preview)
+                }
+                surface.renderer.resize(size, scale: scale)
+                self.ownedIDs[requestID] = leaseID
                 let mode = caseName(request.flatMap { property("presentationMode", in: $0) })
                 let activity = caseName(request.flatMap { property("activityState", in: $0) })
                 surface.renderer.setPlaying(!activity.lowercased().contains("suspended") &&
@@ -122,26 +141,25 @@ final class Handler: NSObject, WallpaperExtensionXPCProtocol {
         DispatchQueue.main.async {
             let mode = caseName(request.flatMap { property("presentationMode", in: $0) })
             let active = caseName(request.flatMap { property("activityState", in: $0) })
-            let key = uuid(id).flatMap { Self.ids[$0] }
-            if let key, let surface = Self.surfaces[key] {
+            if let requestID = uuid(id), let leaseID = self.ownedIDs[requestID], let surface = Self.registry.value(for: leaseID) {
                 let playing = !active.lowercased().contains("suspended") && (surface.preview || mode == "idle" || mode == "locked")
                 surface.renderer.setPlaying(playing)
-                extensionLog("update slot=\(key) mode=\(mode) activity=\(active) playing=\(playing)")
+                extensionLog("update id=\(requestID) mode=\(mode) activity=\(active) playing=\(playing)")
             }
             reply(nil)
         }
     }
     func invalidate(withId id: Any?, reply: @escaping (Error?) -> Void) {
-        // A native wallpaper may drop and reacquire a connection during unlock.
-        // Keep the context and frozen drawable; merely pause the invalidated slot.
         DispatchQueue.main.async {
-            if let key = uuid(id).flatMap({ Self.ids[$0] }) { Self.surfaces[key]?.renderer.setPlaying(false, smoothly: true) }
+            if let requestID = uuid(id), let leaseID = self.ownedIDs.removeValue(forKey: requestID) {
+                Self.registry.release(id: leaseID)
+            }
             reply(nil)
         }
     }
     func snapshot(withId id: Any?, reply: @escaping (Any?, Error?) -> Void) {
         DispatchQueue.main.async {
-            let surface = uuid(id).flatMap { Self.ids[$0] }.flatMap { Self.surfaces[$0] } ?? Self.surfaces.values.first
+            let surface = uuid(id).flatMap { self.ownedIDs[$0] }.flatMap { Self.registry.value(for: $0) }
             reply(surface?.renderer.snapshot(), nil)
         }
     }

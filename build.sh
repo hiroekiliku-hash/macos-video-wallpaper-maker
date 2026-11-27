@@ -16,8 +16,8 @@ for folder, ident, exe, display, kind in [
     (sys.argv[2], 'local.videowallpaper.template', 'VideoWallpaperHost', '壁纸', 'APPL'),
     (sys.argv[3], 'local.videowallpaper.template.extension', 'VideoWallpaperExtension', '壁纸', 'XPC!')]:
     info = dict(CFBundleIdentifier=ident, CFBundleExecutable=exe, CFBundleDisplayName=display,
-                CFBundleName=display, CFBundlePackageType=kind, CFBundleShortVersionString='1.0.0',
-                CFBundleVersion='1', LSMinimumSystemVersion='26.0', CFBundleSupportedPlatforms=['MacOSX'],
+                CFBundleName=display, CFBundlePackageType=kind, CFBundleShortVersionString='1.0.1',
+                CFBundleVersion='2', LSMinimumSystemVersion='26.0', CFBundleSupportedPlatforms=['MacOSX'],
                 CFBundleDevelopmentRegion='zh-Hans', CFBundleLocalizations=['zh-Hans'], CFBundleIconFile='AppIcon')
     if kind == 'XPC!': info['EXAppExtensionAttributes'] = dict(EXExtensionPointIdentifier='com.apple.wallpaper')
     else: info['NSPrincipalClass']='NSApplication'
@@ -34,7 +34,7 @@ xcrun swiftc -swift-version 5 -application-extension -O -whole-module-optimizati
   -framework Cocoa -framework AVFoundation -framework IOSurface -framework ExtensionFoundation \
   -Xlinker -e -Xlinker _NSExtensionMain -import-objc-header "$ROOT/Engine/WallpaperBridge.h" \
   "$ROOT/Engine/NativeEntry.swift" "$ROOT/Engine/ContinuousRenderer.swift" \
-  "$ROOT/Engine/WallpaperConfiguration.swift" "$ROOT"/Engine/Vendor/*.swift \
+  "$ROOT/Engine/WallpaperConfiguration.swift" "$ROOT/Engine/SurfaceRegistry.swift" "$ROOT"/Engine/Vendor/*.swift \
   -o "$EXT/Contents/MacOS/VideoWallpaperExtension"
 xcrun swiftc -swift-version 5 -parse-as-library -O -target arm64-apple-macos26.0 \
   -module-cache-path "$MODULE_CACHE" -framework Cocoa "$ROOT/Engine/Host.swift" \
